@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/sub"
+	"github.com/mhsanaei/3x-ui/v3/internal/tunnelmonitor"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/crypto"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/sys"
 	"github.com/mhsanaei/3x-ui/v3/internal/web"
@@ -32,7 +34,7 @@ import (
 
 // runWebServer initializes and starts the web server for the 3x-ui panel.
 func runWebServer() {
-	log.Printf("Starting %v %v", config.GetName(), config.GetVersion())
+	log.Printf("Starting %v %v", config.GetName(), config.GetPanelVersion())
 
 	switch config.GetLogLevel() {
 	case config.Debug:
@@ -49,12 +51,10 @@ func runWebServer() {
 		log.Fatalf("Unknown log level: %v", config.GetLogLevel())
 	}
 
-	godotenv.Load()
+	_ = godotenv.Load()
 
-	if limit, source := sys.ApplyMemoryLimit(); limit > 0 {
-		logger.Infof("Go memory soft limit set to %d MiB (%s)", limit>>20, source)
-	} else {
-		logger.Info("Go memory soft limit not enforced: ", source)
+	for _, line := range sys.ApplyMemoryTuning() {
+		logger.Info(line)
 	}
 
 	if os.Getenv("XUI_PPROF") == "true" {
@@ -71,27 +71,23 @@ func runWebServer() {
 		log.Fatalf("Error initializing database: %v", err)
 	}
 
-	var server *web.Server
-	server = web.NewServer()
+	server := web.NewServer()
 	global.SetWebServer(server)
 	err = server.Start()
 	if err != nil {
 		log.Fatalf("Error starting web server: %v", err)
-		return
 	}
 
-	var subServer *sub.Server
 	sub.SetDistFS(web.EmbeddedDist())
 	service.RegisterSubLinkProvider(sub.NewLinkProvider())
-	subServer = sub.NewServer()
+	subServer := sub.NewServer()
 	global.SetSubServer(subServer)
 	err = subServer.Start()
 	if err != nil {
 		log.Fatalf("Error starting sub server: %v", err)
-		return
 	}
 
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 8)
 	// Trap shutdown signals
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, sys.SIGUSR1, os.Interrupt)
 	global.SetRestartHook(func() {
@@ -100,6 +96,27 @@ func runWebServer() {
 		default:
 		}
 	})
+
+	var stopTunnelHealthMonitor context.CancelFunc
+	monitorCfg := tunnelmonitor.ConfigFromEnv()
+	if monitorCfg.Enabled {
+		if monitorCfg.ProxyURL == "" {
+			logger.Warning("Tunnel health monitor enabled without XUI_TUNNEL_HEALTH_PROXY: the probe measures host connectivity, not the xray tunnel, so failures will restart xray without fixing host network issues")
+		}
+
+		monitorCtx, cancel := context.WithCancel(context.Background())
+		stopTunnelHealthMonitor = cancel
+
+		monitor, err := tunnelmonitor.New(monitorCfg, func(_ context.Context) error {
+			logger.Warning("Tunnel health monitor threshold reached, restarting xray-core")
+			return server.RestartXray()
+		})
+		if err != nil {
+			logger.Warning("Tunnel health monitor disabled: ", err)
+		} else {
+			go monitor.Run(monitorCtx)
+		}
+	}
 	for {
 		sig := <-sigCh
 
@@ -121,7 +138,6 @@ func runWebServer() {
 			err = server.StartPanelOnly()
 			if err != nil {
 				log.Fatalf("Error restarting web server: %v", err)
-				return
 			}
 			log.Println("Web server restarted successfully.")
 
@@ -131,7 +147,6 @@ func runWebServer() {
 			err = subServer.Start()
 			if err != nil {
 				log.Fatalf("Error restarting sub server: %v", err)
-				return
 			}
 			log.Println("Sub server restarted successfully.")
 		case sys.SIGUSR1:
@@ -142,12 +157,16 @@ func runWebServer() {
 			}
 
 		default:
+			if stopTunnelHealthMonitor != nil {
+				stopTunnelHealthMonitor()
+			}
+
 			// --- FIX FOR TELEGRAM BOT CONFLICT (409) on full shutdown ---
 			tgbot.StopBot()
 			// ------------------------------------------------------------
 
-			server.Stop()
-			subServer.Stop()
+			_ = server.Stop()
+			_ = subServer.Stop()
 			log.Println("Shutting down servers.")
 			return
 		}
@@ -325,7 +344,7 @@ func updateSetting(port int, username string, password string, webBasePath strin
 		if err != nil {
 			fmt.Println("Failed to reset two-factor authentication:", err)
 		} else {
-			settingService.SetTwoFactorToken("")
+			_ = settingService.SetTwoFactorToken("")
 			fmt.Println("Two-factor authentication reset successfully")
 		}
 	}
@@ -335,7 +354,7 @@ func updateSetting(port int, username string, password string, webBasePath strin
 		if err != nil {
 			fmt.Println("Failed to set listen IP:", err)
 		} else {
-			fmt.Printf("listen %v set successfully", listenIP)
+			fmt.Printf("listen %v set successfully\n", listenIP)
 		}
 	}
 
@@ -459,6 +478,7 @@ func GetApiToken(getApiToken bool) {
 func migrateDb() {
 	inboundService := service.InboundService{}
 
+	logger.InitLogger(logging.INFO)
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
 		log.Fatal(err)
@@ -553,14 +573,14 @@ func main() {
 		fmt.Println()
 		fmt.Println("Commands:")
 		fmt.Println("    run            run web panel")
-		fmt.Println("    migrate        migrate form other/old x-ui")
+		fmt.Println("    migrate        migrate from other/old x-ui")
 		fmt.Println("    migrate-db     SQLite <-> .dump (--dump/--restore) or copy into PostgreSQL (--dsn)")
 		fmt.Println("    setting        set settings")
 	}
 
 	flag.Parse()
 	if showVersion {
-		fmt.Println(config.GetVersion())
+		fmt.Println(config.GetPanelVersion())
 		return
 	}
 

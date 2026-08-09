@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router';
 import {
   Alert,
   Button,
@@ -30,6 +30,7 @@ import { propagateOutboundTagRename } from './basics/helpers';
 import { RoutingTab } from './routing';
 import { OutboundsTab } from './outbounds';
 import { BalancersTab } from './balancers';
+import { cleanupOrphanedBalancerLoopbacks, ensureMissingBalancerLoopbacks, detectBalancerCycles } from './balancers/balancer-loopback';
 import { DnsTab } from './dns';
 import { WarpModal, NordModal } from './overrides';
 import './XrayPage.css';
@@ -190,6 +191,20 @@ export default function XrayPage() {
       navigate('/xray#advanced');
       return;
     }
+    if (templateSettings) {
+      const clone = JSON.parse(JSON.stringify(templateSettings));
+      ensureMissingBalancerLoopbacks(clone);
+      cleanupOrphanedBalancerLoopbacks(clone);
+      const cycles = detectBalancerCycles(clone);
+      if (cycles.length > 0) {
+        const names = cycles.map((c) => c.join(' → ')).join(', ');
+        messageApi.error(t('pages.xray.balancer.balancerFallbackCycle') + ' (' + names + ')');
+        return;
+      }
+      const serialized = JSON.stringify(clone, null, 2);
+      setXraySetting(serialized);
+      setTemplateSettings(clone);
+    }
     saveAll();
   }
 
@@ -221,6 +236,7 @@ export default function XrayPage() {
             testingAll={testingAll}
             inboundTags={inboundTags}
             subscriptionOutbounds={subscriptionOutbounds}
+            subscriptionOutboundTags={subscriptionOutboundTags}
             isMobile={isMobile}
             onResetTraffic={resetOutboundsTraffic}
             onTest={onTestOutbound}
