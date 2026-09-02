@@ -75,6 +75,7 @@ func allModels() []any {
 		&model.ApiToken{},
 		&model.ClientRecord{},
 		&model.ClientInbound{},
+		&model.ClientHwid{},
 		&model.ClientExternalLink{},
 		&model.ClientGroup{},
 		&model.InboundFallback{},
@@ -83,10 +84,22 @@ func allModels() []any {
 		&model.NodeClientIp{},
 		&model.ClientGlobalTraffic{},
 		&model.OutboundSubscription{},
+		&model.SubBalancer{},
 	}
 }
 
+func migrateClientTrafficLastSubFetchColumn() error {
+	migrator := db.Migrator()
+	if !migrator.HasTable(&xray.ClientTraffic{}) || migrator.HasColumn(&xray.ClientTraffic{}, "last_sub_fetch") {
+		return nil
+	}
+	return migrator.AddColumn(&xray.ClientTraffic{}, "LastSubFetch")
+}
+
 func initModels() error {
+	if err := migrateClientTrafficLastSubFetchColumn(); err != nil {
+		return err
+	}
 	models := allModels()
 	for _, mdl := range models {
 		if IsPostgres() && postgresModelSettled(mdl) {
@@ -110,6 +123,9 @@ func initModels() error {
 	if err := normalizeApiTokenCreatedAtSeconds(); err != nil {
 		return err
 	}
+	if err := migrateApiTokenScopeAndExpiry(); err != nil {
+		return err
+	}
 	if err := dropLegacyForeignKeys(); err != nil {
 		return err
 	}
@@ -120,6 +136,12 @@ func initModels() error {
 		return err
 	}
 	if err := normalizeInboundSubSortIndex(); err != nil {
+		return err
+	}
+	if err := normalizeClientExternalLinkEnable(); err != nil {
+		return err
+	}
+	if err := normalizeClientExternalLinkTimestamps(); err != nil {
 		return err
 	}
 	if err := repairOverflowedTrafficCounters(); err != nil {
@@ -140,7 +162,13 @@ func initModels() error {
 	if err := migrateTgIDIndex(); err != nil {
 		return err
 	}
+	if err := migrateClientTrafficResetColumns(); err != nil {
+		return err
+	}
 	if err := migrateSyncOrphanColumns(); err != nil {
+		return err
+	}
+	if err := migrateClientEmailLowerIndex(); err != nil {
 		return err
 	}
 	if IsPostgres() {
@@ -300,6 +328,22 @@ func rebuildInboundsWithoutInlineUniquePort() error {
 	})
 }
 
+// AutoMigrate adds the columns; an older SQLite ALTER TABLE leaves them NULL,
+// and a NULL traffic_reset fails every ClientRecord scan, not just the new query.
+func migrateClientTrafficResetColumns() error {
+	if db.Migrator().HasColumn(&model.ClientRecord{}, "traffic_reset") {
+		if err := db.Exec("UPDATE clients SET traffic_reset = 'never' WHERE traffic_reset IS NULL").Error; err != nil {
+			return err
+		}
+	}
+	if db.Migrator().HasColumn(&model.ClientRecord{}, "traffic_reset_day") {
+		if err := db.Exec("UPDATE clients SET traffic_reset_day = 1 WHERE traffic_reset_day IS NULL").Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // AutoMigrate adds the column; this only backfills the NULLs an older SQLite
 // ALTER TABLE leaves behind, so the reaper's predicate never compares to NULL.
 func migrateSyncOrphanColumns() error {
@@ -307,6 +351,15 @@ func migrateSyncOrphanColumns() error {
 		return nil
 	}
 	return db.Exec("UPDATE clients SET sync_orphaned_at = 0 WHERE sync_orphaned_at IS NULL").Error
+}
+
+// The client identity checks match emails case-insensitively; without an
+// expression index (which no GORM struct tag can declare) they seq-scan.
+func migrateClientEmailLowerIndex() error {
+	if db.Migrator().HasIndex(&model.ClientRecord{}, "idx_clients_email_lower") {
+		return nil
+	}
+	return db.Exec("CREATE INDEX IF NOT EXISTS idx_clients_email_lower ON clients (LOWER(email))").Error
 }
 
 func migrateHostVerifyPeerCertByNameColumn() error {
@@ -927,6 +980,40 @@ func normalizeInboundSubSortIndex() error {
 	}
 	if res.RowsAffected > 0 {
 		log.Printf("Normalized sub_sort_index on %d inbound(s)", res.RowsAffected)
+	}
+	return nil
+}
+
+// normalizeClientExternalLinkEnable keeps external-link rows written before the
+// enable column existed enabled; disabled rows from newer builds stay false.
+func normalizeClientExternalLinkEnable() error {
+	res := db.Exec("UPDATE client_external_links SET enable = ? WHERE enable IS NULL", true)
+	if res.Error != nil {
+		log.Printf("Error normalizing client external link enable: %v", res.Error)
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("Normalized enable on %d client external link(s)", res.RowsAffected)
+	}
+	return nil
+}
+
+// normalizeClientExternalLinkTimestamps zeroes the NULLs an older build could
+// leave behind, so the sub-side expiry predicate never drops a legacy row.
+func normalizeClientExternalLinkTimestamps() error {
+	res := db.Exec("UPDATE client_external_links SET expiry_time = 0 WHERE expiry_time IS NULL")
+	if res.Error != nil {
+		log.Printf("Error normalizing client external link expiry_time: %v", res.Error)
+		return res.Error
+	}
+	expiryRows := res.RowsAffected
+	res = db.Exec("UPDATE client_external_links SET last_fetch_at = 0 WHERE last_fetch_at IS NULL")
+	if res.Error != nil {
+		log.Printf("Error normalizing client external link last_fetch_at: %v", res.Error)
+		return res.Error
+	}
+	if expiryRows+res.RowsAffected > 0 {
+		log.Printf("Normalized timestamps on %d client external link(s)", expiryRows+res.RowsAffected)
 	}
 	return nil
 }
@@ -2062,6 +2149,22 @@ func normalizeApiTokenCreatedAtSeconds() error {
 	return db.Model(&model.ApiToken{}).
 		Where("created_at >= ?", model.ApiTokenUnixMillisecondsThreshold).
 		UpdateColumn("created_at", gorm.Expr("created_at / ?", 1000)).Error
+}
+
+func migrateApiTokenScopeAndExpiry() error {
+	m := db.Migrator()
+	if !m.HasColumn(&model.ApiToken{}, "Scope") {
+		if err := m.AddColumn(&model.ApiToken{}, "Scope"); err != nil {
+			return err
+		}
+	}
+	if !m.HasColumn(&model.ApiToken{}, "ExpiresAt") {
+		if err := m.AddColumn(&model.ApiToken{}, "ExpiresAt"); err != nil {
+			return err
+		}
+	}
+	return db.Model(&model.ApiToken{}).Where("scope IS NULL OR TRIM(scope) = ''").
+		Updates(map[string]any{"scope": model.ApiScopeAdmin, "expires_at": 0}).Error
 }
 
 // openPostgresWithRetry retries the initial PostgreSQL connection with
